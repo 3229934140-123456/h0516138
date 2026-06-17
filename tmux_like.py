@@ -11,8 +11,9 @@ import termios
 import signal
 import threading
 import traceback
+import select
 from dataclasses import dataclass, field
-from typing import Optional, Callable
+from typing import Optional, Callable, Union, List, Tuple
 
 from pty_manager import PTYManager
 from screen_buffer import ScreenBuffer, Cell, CellAttr
@@ -23,6 +24,10 @@ DEFAULT_TERM = os.environ.get("TERM", "xterm-256color")
 DEFAULT_SHELL = os.environ.get("SHELL", "/bin/bash")
 SOCKET_PATH = os.path.expanduser("~/.tmux_impl_socket")
 SERVER_PID_PATH = os.path.expanduser("~/.tmux_impl_server.pid")
+
+
+MIN_PANE_W = 5
+MIN_PANE_H = 3
 
 
 def send_msg(sock: socket.socket, obj: dict) -> None:
@@ -60,6 +65,24 @@ def recv_msg(sock: socket.socket, timeout: Optional[float] = None) -> Optional[d
 
 
 @dataclass
+class LayoutNode:
+    is_leaf: bool
+    pane_id: Optional[str] = None
+    direction: Optional[str] = None
+    children: List['LayoutNode'] = field(default_factory=list)
+    ratios: List[float] = field(default_factory=list)
+    parent: Optional['LayoutNode'] = field(default=None, repr=False)
+
+    def collect_leaf_ids(self) -> List[str]:
+        if self.is_leaf:
+            return [self.pane_id] if self.pane_id else []
+        result = []
+        for c in self.children:
+            result.extend(c.collect_leaf_ids())
+        return result
+
+
+@dataclass
 class PaneData:
     id: str
     session_id: str
@@ -90,6 +113,7 @@ class PaneData:
 class SessionData:
     id: str
     name: str
+    root: LayoutNode
     attached: bool = False
     attached_client: Optional[str] = None
     panes: dict = field(default_factory=dict)
@@ -108,12 +132,6 @@ class SessionData:
     def remove_pane(self, pid: str) -> None:
         if pid in self.panes:
             del self.panes[pid]
-            if self.focused_pane_id == pid:
-                remaining = self.list_pane_ids()
-                if remaining:
-                    self.focus_pane(remaining[0])
-                else:
-                    self.focused_pane_id = None
 
     def focus_pane(self, pid: str) -> None:
         for p in self.panes.values():
@@ -131,6 +149,152 @@ class SessionData:
         self.last_activity = time.time()
 
 
+def _find_leaf(root: LayoutNode, pane_id: str) -> Optional[LayoutNode]:
+    if root.is_leaf:
+        return root if root.pane_id == pane_id else None
+    for c in root.children:
+        r = _find_leaf(c, pane_id)
+        if r:
+            return r
+    return None
+
+
+def _apply_layout(node: LayoutNode, x: int, y: int, w: int, h: int,
+                  panes: dict, pty_set_sizes: dict) -> None:
+    if node.is_leaf:
+        pid = node.pane_id
+        if pid and pid in panes:
+            p = panes[pid]
+            new_w = max(MIN_PANE_W, w)
+            new_h = max(MIN_PANE_H, h)
+            if p.x != x or p.y != y or p.width != new_w or p.height != new_h:
+                p.x, p.y, p.width, p.height = x, y, new_w, new_h
+                p.buffer.resize(new_w, new_h)
+                if p.pty_fd is not None:
+                    pty_set_sizes[p.pty_fd] = (new_w, new_h)
+            else:
+                p.x, p.y, p.width, p.height = x, y, new_w, new_h
+        return
+
+    direction = node.direction
+    children = node.children
+    ratios = node.ratios
+    n = len(children)
+    if n == 0:
+        return
+
+    if n == 1:
+        _apply_layout(children[0], x, y, w, h, panes, pty_set_sizes)
+        return
+
+    if direction == 'vertical':
+        avail = max(MIN_PANE_W * n, w)
+        sizes = [max(MIN_PANE_W, int(avail * r)) for r in ratios]
+        diff = avail - sum(sizes)
+        if diff != 0 and sizes:
+            sizes[-1] += diff
+        cur_x = x
+        for i, ch in enumerate(children):
+            cw = sizes[i]
+            _apply_layout(ch, cur_x, y, cw, h, panes, pty_set_sizes)
+            cur_x += cw
+    else:
+        avail = max(MIN_PANE_H * n, h)
+        sizes = [max(MIN_PANE_H, int(avail * r)) for r in ratios]
+        diff = avail - sum(sizes)
+        if diff != 0 and sizes:
+            sizes[-1] += diff
+        cur_y = y
+        for i, ch in enumerate(children):
+            ch_h = sizes[i]
+            _apply_layout(ch, x, cur_y, w, ch_h, panes, pty_set_sizes)
+            cur_y += ch_h
+
+
+def _split_leaf(root: LayoutNode, target_id: str, new_id: str,
+                direction: str, ratio: float) -> Optional[LayoutNode]:
+    leaf = _find_leaf(root, target_id)
+    if leaf is None:
+        return None
+
+    parent = leaf.parent
+    new_leaf_a = LayoutNode(is_leaf=True, pane_id=leaf.pane_id, parent=None)
+    new_leaf_b = LayoutNode(is_leaf=True, pane_id=new_id, parent=None)
+    r1, r2 = ratio, 1.0 - ratio
+
+    container = LayoutNode(
+        is_leaf=False,
+        direction=direction,
+        children=[new_leaf_a, new_leaf_b],
+        ratios=[r1, r2],
+        parent=parent,
+    )
+    new_leaf_a.parent = container
+    new_leaf_b.parent = container
+
+    if parent is None:
+        return container
+
+    idx = parent.children.index(leaf)
+    parent.children[idx] = container
+    _renormalize_ratios(parent)
+    return None
+
+
+def _renormalize_ratios(node: LayoutNode) -> None:
+    if not node.children:
+        return
+    total = sum(node.ratios)
+    if total <= 0:
+        n = len(node.children)
+        node.ratios = [1.0 / n for _ in range(n)]
+    else:
+        node.ratios = [r / total for r in node.ratios]
+
+
+def _remove_leaf(root: LayoutNode, target_id: str) -> Tuple[Optional[LayoutNode], Optional[str]]:
+    leaf = _find_leaf(root, target_id)
+    if leaf is None:
+        return root, None
+
+    parent = leaf.parent
+    if parent is None:
+        return None, None
+
+    neighbor_id = None
+    try:
+        idx = parent.children.index(leaf)
+        other_idx = 1 - idx if len(parent.children) == 2 else (idx + 1) % len(parent.children)
+        if 0 <= other_idx < len(parent.children):
+            neighbor = parent.children[other_idx]
+            if neighbor.is_leaf:
+                neighbor_id = neighbor.pane_id
+            else:
+                leaves = neighbor.collect_leaf_ids()
+                if leaves:
+                    neighbor_id = leaves[0]
+    except Exception:
+        pass
+
+    del parent.children[idx]
+    del parent.ratios[idx]
+
+    _renormalize_ratios(parent)
+
+    if len(parent.children) == 1:
+        only_child = parent.children[0]
+        grandparent = parent.parent
+        only_child.parent = grandparent
+        if grandparent is None:
+            return only_child, neighbor_id
+        gidx = grandparent.children.index(parent)
+        grandparent.children[gidx] = only_child
+        _renormalize_ratios(grandparent)
+        return root, neighbor_id
+
+    return root, neighbor_id
+
+
 class ServerState:
     def __init__(self):
         self.pty_mgr = PTYManager()
@@ -141,8 +305,10 @@ class ServerState:
     def create_session(self, name: str, cols: int, rows: int) -> SessionData:
         with self.lock:
             sid = str(uuid.uuid4())[:8]
-            sess = SessionData(id=sid, name=name)
             pane_id = str(uuid.uuid4())[:8]
+            root = LayoutNode(is_leaf=True, pane_id=pane_id, parent=None)
+            sess = SessionData(id=sid, name=name, root=root)
+
             fd = self.pty_mgr.create_pty(cols, rows, DEFAULT_SHELL)
             buf = ScreenBuffer(cols, rows)
             pane = PaneData(id=pane_id, session_id=sid, pty_fd=fd,
@@ -207,6 +373,15 @@ class ServerState:
                 self.pty_mgr.write_to_pty(p.pty_fd, data)
                 s.touch()
 
+    def _relayout(self, s: SessionData, total_w: int, total_h: int) -> None:
+        pty_sizes = {}
+        _apply_layout(s.root, 0, 0, total_w, total_h, s.panes, pty_sizes)
+        for fd, (w, h) in pty_sizes.items():
+            try:
+                self.pty_mgr.resize_pty(fd, w, h)
+            except Exception:
+                pass
+
     def split(self, sid: str, direction: str, ratio: float = 0.5) -> Optional[PaneData]:
         with self.lock:
             s = self.sessions.get(sid)
@@ -217,57 +392,41 @@ class ServerState:
                 return None
 
             pane_id = str(uuid.uuid4())[:8]
+            new_root = _split_leaf(s.root, cur.id, pane_id, direction, ratio)
 
             if direction == 'horizontal':
-                h1 = max(3, int(cur.height * ratio))
-                h2 = max(3, cur.height - h1)
+                h1 = max(MIN_PANE_H, int(cur.height * ratio))
+                h2 = max(MIN_PANE_H, cur.height - h1)
                 total = h1 + h2
                 if total != cur.height:
                     h1 = cur.height - h2
-
-                new_y = cur.y
-                new_h = h1
-                old_y = cur.y + h1
-                old_h = h2
-
-                fd = self.pty_mgr.create_pty(cur.width, new_h, DEFAULT_SHELL)
-                buf = ScreenBuffer(cur.width, new_h)
+                fd = self.pty_mgr.create_pty(cur.width, h1, DEFAULT_SHELL)
+                buf = ScreenBuffer(cur.width, h1)
                 new_pane = PaneData(id=pane_id, session_id=sid, pty_fd=fd,
-                                    buffer=buf, x=cur.x, y=new_y,
-                                    width=cur.width, height=new_h)
-
-                cur.y = old_y
-                cur.height = old_h
-                cur.resize(cur.width, old_h)
-                if cur.pty_fd:
-                    self.pty_mgr.resize_pty(cur.pty_fd, cur.width, old_h)
-
+                                    buffer=buf, x=cur.x, y=cur.y,
+                                    width=cur.width, height=h1)
             else:
-                w1 = max(5, int(cur.width * ratio))
-                w2 = max(5, cur.width - w1)
+                w1 = max(MIN_PANE_W, int(cur.width * ratio))
+                w2 = max(MIN_PANE_W, cur.width - w1)
                 total = w1 + w2
                 if total != cur.width:
                     w1 = cur.width - w2
-
-                new_x = cur.x
-                new_w = w1
-                old_x = cur.x + w1
-                old_w = w2
-
-                fd = self.pty_mgr.create_pty(new_w, cur.height, DEFAULT_SHELL)
-                buf = ScreenBuffer(new_w, cur.height)
+                fd = self.pty_mgr.create_pty(w1, cur.height, DEFAULT_SHELL)
+                buf = ScreenBuffer(w1, cur.height)
                 new_pane = PaneData(id=pane_id, session_id=sid, pty_fd=fd,
-                                    buffer=buf, x=new_x, y=cur.y,
-                                    width=new_w, height=cur.height)
-
-                cur.x = old_x
-                cur.width = old_w
-                cur.resize(old_w, cur.height)
-                if cur.pty_fd:
-                    self.pty_mgr.resize_pty(cur.pty_fd, old_w, cur.height)
+                                    buffer=buf, x=cur.x, y=cur.y,
+                                    width=w1, height=cur.height)
 
             s.add_pane(new_pane)
             self._fd_to_pane[fd] = new_pane
+
+            if new_root is not None:
+                s.root = new_root
+
+            total_w = max(p.width + p.x for p in s.panes.values())
+            total_h = max(p.height + p.y for p in s.panes.values())
+            self._relayout(s, total_w, total_h)
+
             s.focus_pane(pane_id)
             s.touch()
             return new_pane
@@ -281,38 +440,71 @@ class ServerState:
             if not cur:
                 return False
             pid = cur.id
+            cur_fd = cur.pty_fd
 
             if len(s.panes) == 1:
+                if cur_fd is not None:
+                    try:
+                        del self._fd_to_pane[cur_fd]
+                    except Exception:
+                        pass
+                    self.pty_mgr.destroy_pty(cur_fd)
+                s.remove_pane(pid)
                 self.kill_session(sid)
                 return True
 
-            if cur.pty_fd is not None:
+            cx, cy = cur.x + cur.width // 2, cur.y + cur.height // 2
+            remaining_before = [p for p in s.panes.values() if p.id != pid]
+
+            candidates_direct = []
+            for p in remaining_before:
+                for test_pt in [(p.x + p.width // 2, p.y - 1),
+                                 (p.x + p.width // 2, p.y + p.height),
+                                 (p.x - 1, p.y + p.height // 2),
+                                 (p.x + p.width, p.y + p.height // 2)]:
+                    tx, ty = test_pt
+                    if (cur.x <= tx < cur.x + cur.width and
+                            cur.y <= ty < cur.y + cur.height):
+                        candidates_direct.append(p)
+                        break
+
+            if candidates_direct:
+                def dist(p):
+                    px, py = p.x + p.width // 2, p.y + p.height // 2
+                    return (px - cx) ** 2 + (py - cy) ** 2
+                candidates_direct.sort(key=dist)
+                neighbor_fallback = candidates_direct[0].id
+            else:
+                sorted_p = sorted(remaining_before,
+                                  key=lambda p: (p.y, p.x))
+                neighbor_fallback = sorted_p[0].id if sorted_p else None
+
+            new_root, tree_neighbor_id = _remove_leaf(s.root, pid)
+            if new_root is not None:
+                s.root = new_root
+            elif s.root.is_leaf and len(s.panes) <= 1:
+                pass
+
+            focus_target = tree_neighbor_id or neighbor_fallback
+            if focus_target is None and s.list_pane_ids():
+                focus_target = s.list_pane_ids()[0]
+
+            if cur_fd is not None:
                 try:
-                    del self._fd_to_pane[cur.pty_fd]
+                    del self._fd_to_pane[cur_fd]
                 except Exception:
                     pass
-                self.pty_mgr.destroy_pty(cur.pty_fd)
+                self.pty_mgr.destroy_pty(cur_fd)
             s.remove_pane(pid)
 
-            remaining = s.list_pane_ids()
-            if remaining:
-                target_id = remaining[0]
-                target = s.panes.get(target_id)
-                if target:
-                    target.x = 0
-                    target.y = 0
-                    target.width = target.width
-                    target.height = target.height
-                    all_w = max(p.width for p in s.panes.values())
-                    all_h = sum(p.height for p in s.panes.values())
-                    target.x = 0
-                    target.y = 0
-                    try:
-                        first = s.panes[remaining[0]]
-                        first.x = 0
-                        first.y = 0
-                    except Exception:
-                        pass
+            total_w = max(p.width + p.x for p in s.panes.values()) if s.panes else 80
+            total_h = max(p.height + p.y for p in s.panes.values()) if s.panes else 24
+            self._relayout(s, total_w, total_h)
+
+            if focus_target and focus_target in s.panes:
+                s.focus_pane(focus_target)
+            elif s.list_pane_ids():
+                s.focus_pane(s.list_pane_ids()[0])
 
             s.touch()
             return False
@@ -348,17 +540,15 @@ class ServerState:
                     break
 
             if found is None:
-                sorted_panes = sorted(s.panes.values(), key=lambda p: (p.y, p.x))
-                idx = None
-                for i, p in enumerate(sorted_panes):
-                    if p.id == cur.id:
-                        idx = i
-                        break
-                if idx is not None and sorted_panes:
-                    if direction in ('down', 'right'):
-                        found = sorted_panes[(idx + 1) % len(sorted_panes)]
-                    else:
-                        found = sorted_panes[(idx - 1) % len(sorted_panes)]
+                def edge_dist(p):
+                    px, py = p.x + p.width // 2, p.y + p.height // 2
+                    return (px - cx) ** 2 + (py - cy) ** 2
+                panes_sorted = sorted(
+                    [p for p in s.panes.values() if p.id != cur.id],
+                    key=edge_dist
+                )
+                if panes_sorted:
+                    found = panes_sorted[0]
 
             if found:
                 s.focus_pane(found.id)
@@ -371,32 +561,9 @@ class ServerState:
             s = self.sessions.get(sid)
             if not s:
                 return
-            if len(s.panes) == 1:
-                p = s.focused()
-                if p:
-                    p.x, p.y = 0, 0
-                    p.resize(cols, rows)
-                    if p.pty_fd:
-                        self.pty_mgr.resize_pty(p.pty_fd, cols, rows)
-            else:
-                panes = list(s.panes.values())
-                total_h = sum(p.height for p in panes)
-                total_w = max(p.width for p in panes) if panes else 0
-                if total_h > 0 and rows > 0:
-                    scale_h = rows / total_h
-                    cur_y = 0
-                    for i, p in enumerate(panes):
-                        if i == len(panes) - 1:
-                            new_h = max(3, rows - cur_y)
-                        else:
-                            new_h = max(3, int(p.height * scale_h))
-                        p.y = cur_y
-                        p.height = new_h
-                        p.width = cols
-                        p.resize(cols, new_h)
-                        if p.pty_fd:
-                            self.pty_mgr.resize_pty(p.pty_fd, cols, new_h)
-                        cur_y += new_h
+            cols = max(MIN_PANE_W, cols)
+            rows = max(MIN_PANE_H, rows)
+            self._relayout(s, cols, rows)
             s.touch()
 
     def poll_pty(self) -> None:
@@ -463,7 +630,6 @@ def server_loop():
     clients = {}
 
     def handle_client(conn: socket.socket, addr):
-        buf = io.StringIO()
         try:
             while True:
                 msg = recv_msg(conn, 0.1)
@@ -528,6 +694,13 @@ def server_loop():
                 elif cmd == "close":
                     sid = msg.get("session_id", "")
                     SERVER.close_focused(sid)
+                    if sid not in SERVER.sessions:
+                        try:
+                            send_msg(conn, {"type": "session_closed"})
+                        except Exception:
+                            pass
+                        if sid in clients:
+                            del clients[sid]
 
                 elif cmd == "focus":
                     sid = msg.get("session_id", "")
@@ -600,9 +773,6 @@ def server_loop():
             os.unlink(SERVER_PID_PATH)
         except Exception:
             pass
-
-
-import select
 
 
 def is_server_running() -> bool:
@@ -685,7 +855,7 @@ class ClientApp:
         self.last_render_text = ""
         self.detached = False
         self.running = False
-        self.last_snap = None
+        self.session_closed = False
 
     def cmd_new(self, name: str = "default"):
         if not is_server_running():
@@ -785,6 +955,7 @@ class ClientApp:
             if resp and resp.get("type") == "ok":
                 ids = [s["id"] for s in resp["sessions"]]
                 if self.session_id not in ids:
+                    self.session_closed = True
                     self.running = False
 
         def do_help():
@@ -792,10 +963,11 @@ class ClientApp:
                 "Terminal Multiplexer - Help\n"
                 "==========================\n"
                 "Prefix key: Ctrl+B\n\n"
-                "  Ctrl+B \"    Split horizontally\n"
-                "  Ctrl+B %    Split vertically\n"
+                "  Ctrl+B \"    Split horizontally (上下)\n"
+                "  Ctrl+B %    Split vertically (左右)\n"
                 "  Ctrl+B x    Close current pane\n"
-                "  Ctrl+B d    Detach from session\n"
+                "  Ctrl+B d    Detach from session (普通 d)\n"
+                "  Ctrl+B C-d  Detach from session (Ctrl+d)\n"
                 "  Ctrl+B s    List sessions\n"
                 "  Ctrl+B ?    This help\n"
                 "  Ctrl+B <arrow>  Move focus\n\n"
@@ -878,23 +1050,26 @@ class ClientApp:
             pass
 
     def _main_loop(self):
-        while self.running and not self.detached:
+        while self.running and not self.detached and not self.session_closed:
             try:
                 self.reader.poll()
             except Exception:
                 pass
 
             msg = recv_msg(self.sock, 0.01)
-            if msg and msg.get("type") == "render":
-                self._apply_render(msg["data"])
-            elif msg and msg.get("type") == "error":
-                break
+            if msg:
+                mtype = msg.get("type")
+                if mtype == "render":
+                    self._apply_render(msg["data"])
+                elif mtype == "error":
+                    break
+                elif mtype == "session_closed":
+                    self.session_closed = True
+                    break
 
     def _apply_render(self, snap: dict):
         try:
-            self.last_snap = snap
             parts = bytearray()
-
             parts.extend(b'\x1b[?25l')
 
             for p in snap["panes"]:
@@ -957,6 +1132,8 @@ class ClientApp:
 
         if self.detached:
             print("[detached]")
+        elif self.session_closed:
+            print("[session closed]")
 
         try:
             if self.sock:
@@ -968,9 +1145,9 @@ class ClientApp:
 def main():
     if len(sys.argv) < 2:
         print("Usage:")
-        print("  tmux_impl.py new [session_name]   - Create new session")
-        print("  tmux_impl.py attach <session_id> - Attach to existing session")
-        print("  tmux_impl.py list                 - List active sessions")
+        print("  tmux_like.py new [session_name]   - Create new session")
+        print("  tmux_like.py attach <session_id> - Attach to existing session")
+        print("  tmux_like.py list                 - List active sessions")
         sys.exit(0)
 
     cmd = sys.argv[1]

@@ -596,7 +596,7 @@ class InputRouter:
                 binding.handler()
                 return True
 
-        if event.is_control('d'):
+        if event.is_control('d') or event.is_char('d') or event.key == 'd':
             for b in self.bindings.values():
                 if b.description == 'detach':
                     b.handler()
