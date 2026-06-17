@@ -12,6 +12,7 @@ import signal
 import threading
 import traceback
 import select
+import shlex
 from dataclasses import dataclass, field
 from typing import Optional, Callable, Union, List, Tuple
 
@@ -28,6 +29,11 @@ SERVER_PID_PATH = os.path.expanduser("~/.tmux_impl_server.pid")
 
 MIN_PANE_W = 5
 MIN_PANE_H = 3
+STATUS_BAR_H = 1
+STATUS_BAR_STYLE = "\x1b[48;5;234m\x1b[38;5;250m"
+STATUS_BAR_FOCUS = "\x1b[48;5;33m\x1b[38;5;231m"
+STATUS_BAR_ACCENT = "\x1b[48;5;240m\x1b[38;5;255m"
+RESET_STYLE = "\x1b[0m"
 
 
 def send_msg(sock: socket.socket, obj: dict) -> None:
@@ -120,6 +126,13 @@ class SessionData:
     focused_pane_id: Optional[str] = None
     created_at: float = field(default_factory=time.time)
     last_activity: float = field(default_factory=time.time)
+    screen_cols: int = 80
+    screen_rows: int = 24
+
+    def pane_area_size(self) -> Tuple[int, int]:
+        h = max(1, self.screen_rows - STATUS_BAR_H)
+        w = max(MIN_PANE_W, self.screen_cols)
+        return w, h
 
     def list_pane_ids(self) -> list:
         return list(self.panes.keys())
@@ -302,28 +315,71 @@ class ServerState:
         self._fd_to_pane: dict[int, PaneData] = {}
         self.lock = threading.RLock()
 
-    def create_session(self, name: str, cols: int, rows: int) -> SessionData:
+    def _find_session_by_name(self, name: str) -> Optional[SessionData]:
+        hits = [s for s in self.sessions.values() if s.name == name]
+        return hits[0] if hits else None
+
+    def _unique_name(self, base: str) -> str:
+        if not self._find_session_by_name(base):
+            return base
+        i = 1
+        while True:
+            cand = f"{base}-{i}"
+            if not self._find_session_by_name(cand):
+                return cand
+            i += 1
+
+    def create_session(self, name: str, cols: int, rows: int,
+                       allow_rename: bool = True) -> Tuple[Optional[SessionData], str]:
         with self.lock:
+            existing = self._find_session_by_name(name)
+            if existing:
+                if allow_rename:
+                    name = self._unique_name(name)
+                    msg = f"Session renamed to '{name}' to avoid conflict"
+                else:
+                    return None, f"Session with name '{name}' already exists"
+            else:
+                msg = "ok"
+
             sid = str(uuid.uuid4())[:8]
             pane_id = str(uuid.uuid4())[:8]
             root = LayoutNode(is_leaf=True, pane_id=pane_id, parent=None)
             sess = SessionData(id=sid, name=name, root=root)
+            sess.screen_cols = cols
+            sess.screen_rows = rows
 
-            fd = self.pty_mgr.create_pty(cols, rows, DEFAULT_SHELL)
-            buf = ScreenBuffer(cols, rows)
+            area_w, area_h = sess.pane_area_size()
+            fd = self.pty_mgr.create_pty(area_w, area_h, DEFAULT_SHELL)
+            buf = ScreenBuffer(area_w, area_h)
             pane = PaneData(id=pane_id, session_id=sid, pty_fd=fd,
-                            buffer=buf, x=0, y=0, width=cols, height=rows)
+                            buffer=buf, x=0, y=0, width=area_w, height=area_h)
             sess.add_pane(pane)
             self._fd_to_pane[fd] = pane
             self.sessions[sid] = sess
-            return sess
+            return sess, msg
 
-    def kill_session(self, sid: str) -> None:
+    def rename_session(self, sid_or_name: str, new_name: str) -> Tuple[bool, str]:
         with self.lock:
-            if sid not in self.sessions:
-                return
-            sess = self.sessions[sid]
-            for p in list(sess.panes.values()):
+            s = self.sessions.get(sid_or_name) or self._find_session_by_name(sid_or_name)
+            if not s:
+                return False, f"Session '{sid_or_name}' not found"
+
+            existing = self._find_session_by_name(new_name)
+            if existing and existing.id != s.id:
+                return False, f"Session name '{new_name}' already in use"
+
+            s.name = new_name
+            s.touch()
+            return True, f"Renamed to '{new_name}'"
+
+    def kill_session(self, sid_or_name: str) -> Tuple[bool, str]:
+        with self.lock:
+            s = self.sessions.get(sid_or_name) or self._find_session_by_name(sid_or_name)
+            if not s:
+                return False, f"Session '{sid_or_name}' not found"
+            sid = s.id
+            for p in list(s.panes.values()):
                 if p.pty_fd is not None:
                     try:
                         del self._fd_to_pane[p.pty_fd]
@@ -331,19 +387,20 @@ class ServerState:
                         pass
                     self.pty_mgr.destroy_pty(p.pty_fd)
             del self.sessions[sid]
+            return True, f"Session '{sid_or_name}' killed"
 
-    def attach(self, sid: str, client_id: str) -> Optional[SessionData]:
+    def attach_by_name_or_id(self, target: str, client_id: str) -> Tuple[Optional[SessionData], str]:
         with self.lock:
-            if sid not in self.sessions:
-                return None
-            s = self.sessions[sid]
+            s = self.sessions.get(target) or self._find_session_by_name(target)
+            if not s:
+                return None, f"Session '{target}' not found"
             if s.attached and s.attached_client:
                 s.attached = False
                 s.attached_client = None
             s.attached = True
             s.attached_client = client_id
             s.touch()
-            return s
+            return s, f"Attached to '{s.name}'"
 
     def detach(self, sid: str) -> Optional[SessionData]:
         with self.lock:
@@ -373,9 +430,10 @@ class ServerState:
                 self.pty_mgr.write_to_pty(p.pty_fd, data)
                 s.touch()
 
-    def _relayout(self, s: SessionData, total_w: int, total_h: int) -> None:
+    def _relayout(self, s: SessionData) -> None:
+        area_w, area_h = s.pane_area_size()
         pty_sizes = {}
-        _apply_layout(s.root, 0, 0, total_w, total_h, s.panes, pty_sizes)
+        _apply_layout(s.root, 0, 0, area_w, area_h, s.panes, pty_sizes)
         for fd, (w, h) in pty_sizes.items():
             try:
                 self.pty_mgr.resize_pty(fd, w, h)
@@ -394,28 +452,29 @@ class ServerState:
             pane_id = str(uuid.uuid4())[:8]
             new_root = _split_leaf(s.root, cur.id, pane_id, direction, ratio)
 
+            area_w, area_h = s.pane_area_size()
             if direction == 'horizontal':
-                h1 = max(MIN_PANE_H, int(cur.height * ratio))
-                h2 = max(MIN_PANE_H, cur.height - h1)
+                h1 = max(MIN_PANE_H, int(area_h * ratio))
+                h2 = max(MIN_PANE_H, area_h - h1)
                 total = h1 + h2
-                if total != cur.height:
-                    h1 = cur.height - h2
-                fd = self.pty_mgr.create_pty(cur.width, h1, DEFAULT_SHELL)
-                buf = ScreenBuffer(cur.width, h1)
+                if total != area_h:
+                    h1 = area_h - h2
+                fd = self.pty_mgr.create_pty(area_w, h1, DEFAULT_SHELL)
+                buf = ScreenBuffer(area_w, h1)
                 new_pane = PaneData(id=pane_id, session_id=sid, pty_fd=fd,
                                     buffer=buf, x=cur.x, y=cur.y,
-                                    width=cur.width, height=h1)
+                                    width=area_w, height=h1)
             else:
-                w1 = max(MIN_PANE_W, int(cur.width * ratio))
-                w2 = max(MIN_PANE_W, cur.width - w1)
+                w1 = max(MIN_PANE_W, int(area_w * ratio))
+                w2 = max(MIN_PANE_W, area_w - w1)
                 total = w1 + w2
-                if total != cur.width:
-                    w1 = cur.width - w2
-                fd = self.pty_mgr.create_pty(w1, cur.height, DEFAULT_SHELL)
-                buf = ScreenBuffer(w1, cur.height)
+                if total != area_w:
+                    w1 = area_w - w2
+                fd = self.pty_mgr.create_pty(w1, area_h, DEFAULT_SHELL)
+                buf = ScreenBuffer(w1, area_h)
                 new_pane = PaneData(id=pane_id, session_id=sid, pty_fd=fd,
                                     buffer=buf, x=cur.x, y=cur.y,
-                                    width=w1, height=cur.height)
+                                    width=w1, height=area_h)
 
             s.add_pane(new_pane)
             self._fd_to_pane[fd] = new_pane
@@ -423,22 +482,20 @@ class ServerState:
             if new_root is not None:
                 s.root = new_root
 
-            total_w = max(p.width + p.x for p in s.panes.values())
-            total_h = max(p.height + p.y for p in s.panes.values())
-            self._relayout(s, total_w, total_h)
+            self._relayout(s)
 
             s.focus_pane(pane_id)
             s.touch()
             return new_pane
 
-    def close_focused(self, sid: str) -> bool:
+    def close_focused(self, sid: str) -> Tuple[bool, str]:
         with self.lock:
             s = self.sessions.get(sid)
             if not s:
-                return False
+                return False, "Session not found"
             cur = s.focused()
             if not cur:
-                return False
+                return False, "No focused pane"
             pid = cur.id
             cur_fd = cur.pty_fd
 
@@ -451,7 +508,7 @@ class ServerState:
                     self.pty_mgr.destroy_pty(cur_fd)
                 s.remove_pane(pid)
                 self.kill_session(sid)
-                return True
+                return True, "session_closed"
 
             cx, cy = cur.x + cur.width // 2, cur.y + cur.height // 2
             remaining_before = [p for p in s.panes.values() if p.id != pid]
@@ -482,8 +539,6 @@ class ServerState:
             new_root, tree_neighbor_id = _remove_leaf(s.root, pid)
             if new_root is not None:
                 s.root = new_root
-            elif s.root.is_leaf and len(s.panes) <= 1:
-                pass
 
             focus_target = tree_neighbor_id or neighbor_fallback
             if focus_target is None and s.list_pane_ids():
@@ -497,9 +552,7 @@ class ServerState:
                 self.pty_mgr.destroy_pty(cur_fd)
             s.remove_pane(pid)
 
-            total_w = max(p.width + p.x for p in s.panes.values()) if s.panes else 80
-            total_h = max(p.height + p.y for p in s.panes.values()) if s.panes else 24
-            self._relayout(s, total_w, total_h)
+            self._relayout(s)
 
             if focus_target and focus_target in s.panes:
                 s.focus_pane(focus_target)
@@ -507,7 +560,7 @@ class ServerState:
                 s.focus_pane(s.list_pane_ids()[0])
 
             s.touch()
-            return False
+            return False, "pane_closed"
 
     def focus_neighbor(self, sid: str, direction: str) -> bool:
         with self.lock:
@@ -556,14 +609,32 @@ class ServerState:
                 return True
             return False
 
+    def focus_cycle(self, sid: str, delta: int = 1) -> bool:
+        with self.lock:
+            s = self.sessions.get(sid)
+            if not s or len(s.panes) <= 1:
+                return False
+            leaves = s.root.collect_leaf_ids()
+            if not leaves:
+                return False
+            cur_id = s.focused_pane_id
+            try:
+                idx = leaves.index(cur_id) if cur_id in leaves else -1
+            except ValueError:
+                idx = -1
+            new_idx = (idx + delta) % len(leaves)
+            s.focus_pane(leaves[new_idx])
+            s.touch()
+            return True
+
     def resize_session(self, sid: str, cols: int, rows: int) -> None:
         with self.lock:
             s = self.sessions.get(sid)
             if not s:
                 return
-            cols = max(MIN_PANE_W, cols)
-            rows = max(MIN_PANE_H, rows)
-            self._relayout(s, cols, rows)
+            s.screen_cols = max(MIN_PANE_W, cols)
+            s.screen_rows = max(MIN_PANE_H + STATUS_BAR_H, rows)
+            self._relayout(s)
             s.touch()
 
     def poll_pty(self) -> None:
@@ -603,6 +674,10 @@ class ServerState:
                 "name": s.name,
                 "panes": panes_info,
                 "focused_id": s.focused_pane_id,
+                "screen_cols": s.screen_cols,
+                "screen_rows": s.screen_rows,
+                "status_bar_h": STATUS_BAR_H,
+                "num_panes": len(s.panes),
             }
 
 
@@ -629,6 +704,12 @@ def server_loop():
 
     clients = {}
 
+    def _resp(conn: socket.socket, **kw) -> None:
+        try:
+            send_msg(conn, dict(kw))
+        except Exception:
+            pass
+
     def handle_client(conn: socket.socket, addr):
         try:
             while True:
@@ -654,32 +735,53 @@ def server_loop():
                     cols = msg.get("cols", 80)
                     rows = msg.get("rows", 24)
                     name = msg.get("name", "default")
-                    sess = SERVER.create_session(name, cols, rows)
-                    clients[sess.id] = conn
-                    SERVER.attach(sess.id, client_id)
-                    send_msg(conn, {"type": "ok", "session_id": sess.id})
+                    sess, info = SERVER.create_session(name, cols, rows, allow_rename=True)
+                    if sess:
+                        clients[sess.id] = conn
+                        SERVER.attach_by_name_or_id(sess.id, client_id)
+                        _resp(conn, type="ok", session_id=sess.id,
+                              session_name=sess.name, info=info)
+                    else:
+                        _resp(conn, type="error", msg=info)
 
                 elif cmd == "attach":
-                    sid = msg.get("session_id", "")
-                    sess = SERVER.attach(sid, client_id)
+                    target = msg.get("session_id", "")
+                    sess, info = SERVER.attach_by_name_or_id(target, client_id)
                     if sess:
-                        clients[sid] = conn
+                        clients[sess.id] = conn
                         cols = msg.get("cols", 80)
                         rows = msg.get("rows", 24)
-                        SERVER.resize_session(sid, cols, rows)
-                        send_msg(conn, {"type": "ok", "session_id": sid})
+                        SERVER.resize_session(sess.id, cols, rows)
+                        _resp(conn, type="ok", session_id=sess.id,
+                              session_name=sess.name, info=info)
                     else:
-                        send_msg(conn, {"type": "error", "msg": "session not found"})
+                        _resp(conn, type="error", msg=info)
 
                 elif cmd == "detach":
                     sid = msg.get("session_id", "")
                     SERVER.detach(sid)
                     if sid in clients:
                         del clients[sid]
-                    send_msg(conn, {"type": "ok"})
+                    _resp(conn, type="ok")
 
                 elif cmd == "list":
-                    send_msg(conn, {"type": "ok", "sessions": SERVER.list_sessions()})
+                    _resp(conn, type="ok", sessions=SERVER.list_sessions())
+
+                elif cmd == "rename":
+                    sid = msg.get("session_id", "")
+                    new_name = msg.get("name", "")
+                    ok, info = SERVER.rename_session(sid, new_name)
+                    _resp(conn, type="ok" if ok else "error", msg=info)
+
+                elif cmd == "kill":
+                    target = msg.get("target", "")
+                    ok, info = SERVER.kill_session(target)
+                    if ok:
+                        for c_sid, c in list(clients.items()):
+                            if c_sid not in SERVER.sessions and c is conn:
+                                del clients[c_sid]
+                    _resp(conn, type="ok" if ok else "error", msg=info,
+                          session_gone=(target == msg.get("session_id", "")))
 
                 elif cmd == "input":
                     sid = msg.get("session_id", "")
@@ -693,19 +795,23 @@ def server_loop():
 
                 elif cmd == "close":
                     sid = msg.get("session_id", "")
-                    SERVER.close_focused(sid)
-                    if sid not in SERVER.sessions:
-                        try:
-                            send_msg(conn, {"type": "session_closed"})
-                        except Exception:
-                            pass
-                        if sid in clients:
+                    ok, info = SERVER.close_focused(sid)
+                    if info == "session_closed":
+                        if sid not in SERVER.sessions and sid in clients:
                             del clients[sid]
+                        _resp(conn, type="session_closed")
+                    else:
+                        _resp(conn, type="ok", msg=info)
 
                 elif cmd == "focus":
                     sid = msg.get("session_id", "")
                     direction = msg.get("direction", "")
                     SERVER.focus_neighbor(sid, direction)
+
+                elif cmd == "cycle_pane":
+                    sid = msg.get("session_id", "")
+                    delta = int(msg.get("delta", 1))
+                    SERVER.focus_cycle(sid, delta)
 
                 elif cmd == "resize":
                     sid = msg.get("session_id", "")
@@ -720,7 +826,7 @@ def server_loop():
                         send_msg(conn, {"type": "render", "data": snap})
 
                 elif cmd == "ping":
-                    send_msg(conn, {"type": "pong"})
+                    _resp(conn, type="pong")
 
         except Exception:
             pass
@@ -840,9 +946,9 @@ def get_terminal_size():
             struct.pack('HHHH', 0, 0, 0, 0)
         )
         rows, cols, _, _ = struct.unpack('HHHH', data)
-        return max(24, rows), max(80, cols)
+        return max(25, rows), max(80, cols)
     except Exception:
-        return 24, 80
+        return 25, 80
 
 
 class ClientApp:
@@ -851,11 +957,23 @@ class ClientApp:
         self.sock: Optional[socket.socket] = None
         self.reader = KeyboardInputReader()
         self.session_id: Optional[str] = None
-        self.rows, self.cols = 24, 80
+        self.session_name: str = "default"
+        self.rows, self.cols = 25, 80
         self.last_render_text = ""
+        self.last_status_key = ""
         self.detached = False
         self.running = False
         self.session_closed = False
+        self.error_message: Optional[str] = None
+        self.error_expire_at: float = 0.0
+        self.command_mode = False
+        self.command_input = ""
+        self.command_cursor = 0
+
+    def show_error(self, msg: str, duration: float = 3.0) -> None:
+        self.error_message = msg
+        self.error_expire_at = time.time() + duration
+        self.last_status_key = ""
 
     def cmd_new(self, name: str = "default"):
         if not is_server_running():
@@ -872,9 +990,10 @@ class ClientApp:
         })
         resp = recv_msg(self.sock, 5.0)
         if not resp or resp.get("type") != "ok":
-            print("Failed to create session")
+            print(f"Failed to create session: {resp.get('msg') if resp else ''}")
             sys.exit(1)
         self.session_id = resp["session_id"]
+        self.session_name = resp.get("session_name", name)
         self._start_ui()
 
     def cmd_attach(self, sid: str):
@@ -893,9 +1012,10 @@ class ClientApp:
         })
         resp = recv_msg(self.sock, 5.0)
         if not resp or resp.get("type") != "ok":
-            print("Session not found")
+            print(f"Failed: {resp.get('msg') if resp else 'Session not found'}")
             sys.exit(1)
-        self.session_id = sid
+        self.session_id = resp["session_id"]
+        self.session_name = resp.get("session_name", sid)
         self._start_ui()
 
     def cmd_list(self):
@@ -914,11 +1034,11 @@ class ClientApp:
                 print("No active sessions")
                 return
             print("Active sessions:")
-            print("-" * 60)
+            print("-" * 70)
             for s in sess:
                 attached = "(attached)" if s["attached"] else "  (detached)"
                 activity = time.ctime(s["last_activity"])
-                print(f"  {s['id']}: {s['name']} [{s['num_panes']} pane(s)] "
+                print(f"  id={s['id']}  name={s['name']!r}  [{s['num_panes']} panes] "
                       f"{attached}  last: {activity}")
         else:
             print("Error listing sessions")
@@ -949,7 +1069,7 @@ class ClientApp:
                 "cmd": "close", "session_id": self.session_id,
             })
             self._request_render()
-            time.sleep(0.1)
+            time.sleep(0.05)
             send_msg(self.sock, {"cmd": "list", "client_id": self.client_id})
             resp = recv_msg(self.sock, 0.5)
             if resp and resp.get("type") == "ok":
@@ -958,21 +1078,47 @@ class ClientApp:
                     self.session_closed = True
                     self.running = False
 
+        def do_cycle():
+            send_msg(self.sock, {
+                "cmd": "cycle_pane", "session_id": self.session_id, "delta": 1
+            })
+            self._request_render()
+
+        def do_next():
+            send_msg(self.sock, {
+                "cmd": "cycle_pane", "session_id": self.session_id, "delta": 1
+            })
+            self._request_render()
+
+        def do_prev():
+            send_msg(self.sock, {
+                "cmd": "cycle_pane", "session_id": self.session_id, "delta": -1
+            })
+            self._request_render()
+
         def do_help():
             self._show_overlay(
                 "Terminal Multiplexer - Help\n"
                 "==========================\n"
                 "Prefix key: Ctrl+B\n\n"
-                "  Ctrl+B \"    Split horizontally (上下)\n"
-                "  Ctrl+B %    Split vertically (左右)\n"
-                "  Ctrl+B x    Close current pane\n"
-                "  Ctrl+B d    Detach from session (普通 d)\n"
-                "  Ctrl+B C-d  Detach from session (Ctrl+d)\n"
-                "  Ctrl+B s    List sessions\n"
-                "  Ctrl+B ?    This help\n"
-                "  Ctrl+B <arrow>  Move focus\n\n"
-                "  Ctrl+C       Sent to focused pane\n"
-                "  Resize terminal = panes auto-adjust\n\n"
+                "  \"          Split horizontally (上下)\n"
+                "  %          Split vertically (左右)\n"
+                "  x          Close current pane\n"
+                "  d / C-d    Detach from session\n"
+                "  o          Cycle panes\n"
+                "  n / p      Next / Previous pane\n"
+                "  <arrow>    Move focus (directional)\n"
+                "  s          List sessions overlay\n"
+                "  :          Command mode\n"
+                "  ?          This help\n\n"
+                "Commands (after Ctrl+B :):\n"
+                "  rename <name>          Rename current session\n"
+                "  new [name]             Create new session\n"
+                "  kill-session [target]  Kill current or target session\n"
+                "  attach <id|name>       Switch to another session\n"
+                "  list                   List sessions\n"
+                "  detach                 Detach\n"
+                "  help                   This help\n\n"
                 "Press any key to continue..."
             )
 
@@ -980,21 +1126,29 @@ class ClientApp:
             send_msg(self.sock, {"cmd": "list", "client_id": self.client_id})
             resp = recv_msg(self.sock, 1.0)
             if resp and resp.get("type") == "ok":
-                lines = ["Active sessions:", "-" * 50]
+                lines = ["Active sessions:", "-" * 60]
                 for s in resp["sessions"]:
                     cur = " <-- current" if s["id"] == self.session_id else ""
                     att = "(attached)" if s["attached"] else ""
-                    lines.append(f"  {s['id']}: {s['name']} [{s['num_panes']} panes] {att}{cur}")
+                    lines.append(f"  id={s['id']}  name={s['name']!r} "
+                                 f"[{s['num_panes']} panes] {att}{cur}")
                 lines.append("")
                 lines.append("Press any key to continue...")
                 self._show_overlay("\n".join(lines))
+
+        def do_command():
+            self._enter_command_mode()
 
         r.register_handler('detach', do_detach)
         r.register_handler('split', do_split)
         r.register_handler('focus', do_focus)
         r.register_handler('close_pane', do_close)
+        r.register_handler('cycle_pane', do_cycle)
+        r.register_handler('next_pane', do_next)
+        r.register_handler('prev_pane', do_prev)
         r.register_handler('help', do_help)
         r.register_handler('list_sessions', do_list)
+        r.register_handler('command_mode', do_command)
 
         r.set_input_callback(self._on_input)
 
@@ -1056,19 +1210,76 @@ class ClientApp:
             except Exception:
                 pass
 
+            if self.command_mode:
+                self._command_mode_poll()
+                continue
+
             msg = recv_msg(self.sock, 0.01)
             if msg:
                 mtype = msg.get("type")
                 if mtype == "render":
                     self._apply_render(msg["data"])
                 elif mtype == "error":
-                    break
+                    self.show_error(msg.get("msg", "Error"))
                 elif mtype == "session_closed":
                     self.session_closed = True
                     break
+                elif mtype == "ok" and "msg" in msg:
+                    pass
+
+    def _render_status_bar(self, snap: dict) -> str:
+        w = snap.get("screen_cols", self.cols)
+        time_str = time.strftime("%H:%M:%S")
+        sname = snap.get("name", "?")
+        sid = snap.get("session_id", "?")
+        num = snap.get("num_panes", 0)
+        fid = snap.get("focused_id", "?")
+        fid_short = fid[:6] if fid else "?"
+
+        left_txt = f" {sname} [{sid}]  panes:{num} "
+        focus_txt = f" [focus:{fid_short}] "
+        right_txt = f" {time_str} "
+
+        pieces = []
+        pieces.append(f"\x1b[{snap['screen_rows']};1H")
+        pieces.append(STATUS_BAR_STYLE)
+
+        if self.error_message and time.time() < self.error_expire_at:
+            msg = f" [!] {self.error_message} "
+        else:
+            if self.command_mode:
+                prompt = ":" + self.command_input
+                cursor_pos = 1 + self.command_cursor
+                msg = " " + prompt + " "
+            else:
+                msg = left_txt
+
+        left_part = msg
+        right_part = focus_txt + right_txt
+        max_left = max(1, w - len(right_part) - 1)
+        left_part = left_part[:max_left]
+        pad = max(0, w - len(left_part) - len(right_part))
+        line = left_part + (" " * pad) + right_part
+        if len(line) > w:
+            line = line[:w]
+
+        if self.command_mode:
+            prompt_w = 1 + len(self.command_input)
+            if prompt_w <= w:
+                cx = min(1 + self.command_cursor, w)
+                pieces.append(line + f"\x1b[{snap['screen_rows']};{cx}H")
+            else:
+                pieces.append(line)
+        else:
+            pieces.append(line)
+
+        pieces.append(RESET_STYLE)
+        return "".join(pieces)
 
     def _apply_render(self, snap: dict):
         try:
+            if "name" in snap:
+                self.session_name = snap["name"]
             parts = bytearray()
             parts.extend(b'\x1b[?25l')
 
@@ -1081,14 +1292,32 @@ class ClientApp:
                 if p["focus"]:
                     focus_pane = p
                     break
+
+            cursor_in_pane = None
             if focus_pane:
                 cx = focus_pane['x'] + min(focus_pane['cursor_x'], focus_pane['width'] - 1)
                 cy = focus_pane['y'] + min(focus_pane['cursor_y'], focus_pane['height'] - 1)
-                if focus_pane.get("cursor_vis", True):
+                if focus_pane.get("cursor_vis", True) and not self.command_mode and not self.error_message:
                     parts.extend(f'\x1b[{cy + 1};{cx + 1}H'.encode())
                     parts.extend(b'\x1b[?25h')
-                else:
-                    parts.extend(b'\x1b[?25l')
+                cursor_in_pane = (cx, cy)
+            else:
+                cursor_in_pane = None
+
+            status_key = (str(snap.get("panes")) + str(time.time())[:2]
+                          + str(self.error_message)
+                          + ("CMD:" + self.command_input if self.command_mode else ""))
+            if status_key != self.last_status_key:
+                status_line = self._render_status_bar(snap)
+                parts.extend(status_line.encode('latin-1', errors='replace'))
+                self.last_status_key = status_key
+
+            if self.command_mode:
+                pass
+            elif self.error_message and time.time() < self.error_expire_at:
+                pass
+            elif cursor_in_pane:
+                parts.extend(f'\x1b[{cursor_in_pane[1] + 1};{cursor_in_pane[0] + 1}H'.encode())
 
             text = parts.decode('latin-1', errors='replace')
             if text != self.last_render_text:
@@ -1115,9 +1344,266 @@ class ClientApp:
 
         self.reader.start()
         self.last_render_text = ""
+        self.last_status_key = ""
         sys.stdout.write("\x1b[H\x1b[2J")
         sys.stdout.flush()
         self._request_render()
+
+    def _enter_command_mode(self):
+        self.command_mode = True
+        self.command_input = ""
+        self.command_cursor = 0
+        self.error_message = None
+        self.last_status_key = ""
+        try:
+            self.reader.stop()
+        except Exception:
+            pass
+        sys.stdout.write("\x1b[?25h")
+        sys.stdout.flush()
+
+    def _exit_command_mode(self, clear_error=True):
+        self.command_mode = False
+        self.command_input = ""
+        self.command_cursor = 0
+        if clear_error:
+            pass
+        try:
+            self.reader.start()
+        except Exception:
+            pass
+        self.last_status_key = ""
+        self._request_render()
+
+    def _command_mode_poll(self):
+        try:
+            r, _, _ = select.select([sys.stdin.fileno()], [], [], 0.02)
+            if not r:
+                snap_req = False
+                if time.time() > (getattr(self, '_last_cmd_render', 0) + 0.15):
+                    snap_req = True
+                    self._last_cmd_render = time.time()
+                if snap_req:
+                    msg = recv_msg(self.sock, 0.01)
+                    if msg and msg.get("type") == "render":
+                        self._apply_render(msg["data"])
+                return
+
+            raw = os.read(sys.stdin.fileno(), 4096)
+            if not raw:
+                return
+
+            for b in raw:
+                byte_val = bytes([b])
+
+                if byte_val in (b'\x1b',):
+                    self._exit_command_mode()
+                    return
+
+                if byte_val in (b'\x0d', b'\x0a'):
+                    line = self.command_input.strip()
+                    self._execute_command(line)
+                    return
+
+                if byte_val in (b'\x7f', b'\x08'):
+                    if self.command_cursor > 0:
+                        self.command_input = (self.command_input[:self.command_cursor - 1]
+                                              + self.command_input[self.command_cursor:])
+                        self.command_cursor -= 1
+                    continue
+
+                if byte_val == b'\x15':
+                    self.command_input = ""
+                    self.command_cursor = 0
+                    continue
+
+                if byte_val == b'\x17':
+                    pos = self.command_cursor
+                    if pos > 0:
+                        while pos > 0 and self.command_input[pos-1] == ' ':
+                            pos -= 1
+                        while pos > 0 and self.command_input[pos-1] != ' ':
+                            pos -= 1
+                        self.command_input = (self.command_input[:pos]
+                                              + self.command_input[self.command_cursor:])
+                        self.command_cursor = pos
+                    continue
+
+                if byte_val == b'\x01':
+                    self.command_cursor = 0
+                    continue
+
+                if byte_val == b'\x05':
+                    self.command_cursor = len(self.command_input)
+                    continue
+
+                if byte_val in (b'\x02',):
+                    if self.command_cursor > 0:
+                        self.command_cursor -= 1
+                    continue
+
+                if byte_val in (b'\x06',):
+                    if self.command_cursor < len(self.command_input):
+                        self.command_cursor += 1
+                    continue
+
+                if b >= 0x20 and b <= 0x7e:
+                    ch = chr(b)
+                    self.command_input = (self.command_input[:self.command_cursor] + ch
+                                          + self.command_input[self.command_cursor:])
+                    self.command_cursor += 1
+                    continue
+
+            self._request_render()
+        except Exception as e:
+            pass
+
+    def _execute_command(self, line: str):
+        try:
+            parts = shlex.split(line) if line.strip() else []
+        except ValueError:
+            self._exec_result(False, "Unbalanced quotes")
+            return
+
+        if not parts:
+            self._exit_command_mode(False)
+            return
+
+        cmd = parts[0].lower()
+        args = parts[1:]
+
+        if cmd == "rename":
+            if not args:
+                self._exec_result(False, "rename: requires <name>")
+                return
+            new_name = args[0]
+            send_msg(self.sock, {
+                "cmd": "rename", "session_id": self.session_id,
+                "name": new_name
+            })
+            resp = recv_msg(self.sock, 1.0) or {}
+            self._exec_result(resp.get("type") == "ok", resp.get("msg", ""))
+            return
+
+        elif cmd == "new":
+            name = args[0] if args else "new-session"
+            send_msg(self.sock, {
+                "cmd": "new", "name": name,
+                "cols": self.cols, "rows": self.rows,
+                "client_id": self.client_id
+            })
+            resp = recv_msg(self.sock, 2.0) or {}
+            if resp.get("type") == "ok":
+                info = resp.get("info", "") or ""
+                self._exec_result(True, f"Created: {resp.get('session_name')!r} "
+                                       f"(id={resp.get('session_id')}) {info}")
+            else:
+                self._exec_result(False, resp.get("msg", "new failed"))
+            return
+
+        elif cmd == "kill-session":
+            target = args[0] if args else self.session_id
+            send_msg(self.sock, {
+                "cmd": "kill", "target": target,
+                "session_id": self.session_id
+            })
+            resp = recv_msg(self.sock, 1.0) or {}
+            ok = resp.get("type") == "ok"
+            msg = resp.get("msg", "")
+            if ok and target == self.session_id and resp.get("session_gone"):
+                self.session_closed = True
+                self.running = False
+                self._exit_command_mode(False)
+                return
+            if target == self.session_id:
+                send_msg(self.sock, {"cmd": "list", "client_id": self.client_id})
+                list_resp = recv_msg(self.sock, 0.5) or {}
+                if list_resp.get("type") == "ok":
+                    ids = [s["id"] for s in list_resp.get("sessions", [])]
+                    if self.session_id not in ids:
+                        self.session_closed = True
+                        self.running = False
+                        self._exit_command_mode(False)
+                        return
+            self._exec_result(ok, msg)
+            return
+
+        elif cmd == "attach":
+            if not args:
+                self._exec_result(False, "attach: requires <id|name>")
+                return
+            target = args[0]
+            send_msg(self.sock, {"cmd": "detach", "session_id": self.session_id})
+            time.sleep(0.05)
+            send_msg(self.sock, {
+                "cmd": "attach", "session_id": target,
+                "cols": self.cols, "rows": self.rows,
+                "client_id": self.client_id
+            })
+            resp = recv_msg(self.sock, 2.0) or {}
+            if resp.get("type") == "ok":
+                self.session_id = resp["session_id"]
+                self.session_name = resp.get("session_name", target)
+                self._exec_result(True, resp.get("info", f"Attached to {target}"))
+                self.last_render_text = ""
+                self.last_status_key = ""
+            else:
+                send_msg(self.sock, {
+                    "cmd": "attach", "session_id": self.session_id,
+                    "cols": self.cols, "rows": self.rows,
+                    "client_id": self.client_id
+                })
+                self._exec_result(False, resp.get("msg", "attach failed"))
+            return
+
+        elif cmd == "list":
+            self._exit_command_mode(False)
+            time.sleep(0.05)
+            send_msg(self.sock, {"cmd": "list", "client_id": self.client_id})
+            resp = recv_msg(self.sock, 1.0) or {}
+            if resp.get("type") == "ok":
+                lines = ["Active sessions:", "-" * 60]
+                for s in resp.get("sessions", []):
+                    cur = " <-- current" if s["id"] == self.session_id else ""
+                    att = "(attached)" if s["attached"] else ""
+                    lines.append(f"  id={s['id']}  name={s['name']!r} "
+                                 f"[{s['num_panes']} panes] {att}{cur}")
+                lines.append("")
+                lines.append("Press any key to continue...")
+                self._show_overlay("\n".join(lines))
+            return
+
+        elif cmd == "detach":
+            self._exit_command_mode(False)
+            self._detach()
+            return
+
+        elif cmd == "help":
+            self._exit_command_mode(False)
+            self._show_overlay(
+                "Terminal Multiplexer - Command Reference\n"
+                "=======================================\n\n"
+                "rename <name>          Rename current session\n"
+                "new [name]             Create new session (stay attached to current)\n"
+                "kill-session [tgt]     Kill current/specified session\n"
+                "attach <id|name>       Switch client to target session\n"
+                "list                   List all sessions\n"
+                "detach                 Detach (same as Ctrl+B d)\n"
+                "help                   This help\n\n"
+                "Press any key to continue..."
+            )
+            return
+
+        else:
+            self._exec_result(False, f"Unknown command: {cmd!r}. Type 'help' for list.")
+            return
+
+    def _exec_result(self, ok: bool, msg: str):
+        if ok:
+            self.show_error(f"OK: {msg}", 3.0) if msg else None
+        else:
+            self.show_error(f"ERROR: {msg}" if msg else "ERROR", 5.0)
+        self._exit_command_mode(clear_error=False)
 
     def _cleanup(self):
         try:
@@ -1145,9 +1631,9 @@ class ClientApp:
 def main():
     if len(sys.argv) < 2:
         print("Usage:")
-        print("  tmux_like.py new [session_name]   - Create new session")
-        print("  tmux_like.py attach <session_id> - Attach to existing session")
-        print("  tmux_like.py list                 - List active sessions")
+        print("  tmux_like.py new [session_name]    Create new session")
+        print("  tmux_like.py attach <id|name>     Attach to session (by id or name)")
+        print("  tmux_like.py list                  List active sessions")
         sys.exit(0)
 
     cmd = sys.argv[1]
@@ -1158,7 +1644,7 @@ def main():
         app.cmd_new(name)
     elif cmd == "attach":
         if len(sys.argv) < 3:
-            print("Error: session_id required")
+            print("Error: session_id or name required")
             sys.exit(1)
         app.cmd_attach(sys.argv[2])
     elif cmd == "list":

@@ -656,6 +656,30 @@ class InputRouter:
                     b.handler()
                     return True
 
+        if event.is_char(':') or event.key == ':':
+            for b in self.bindings.values():
+                if b.description == 'command_mode':
+                    b.handler()
+                    return True
+
+        if event.is_char('o') or event.key == 'o':
+            for b in self.bindings.values():
+                if b.description == 'cycle_pane':
+                    b.handler()
+                    return True
+
+        if event.is_char('n') or event.key == 'n':
+            for b in self.bindings.values():
+                if b.description == 'next_pane':
+                    b.handler()
+                    return True
+
+        if event.is_char('p') or event.key == 'p':
+            for b in self.bindings.values():
+                if b.description == 'prev_pane':
+                    b.handler()
+                    return True
+
         return False
 
     def _handle_binding(self, event: KeyEvent) -> bool:
@@ -863,6 +887,26 @@ class KeyboardInputReader:
             description='list_sessions', require_prefix=True
         )
 
+        self.input_router.register_binding(
+            ':', self._make_command_mode_handler(),
+            description='command_mode', require_prefix=True
+        )
+
+        self.input_router.register_binding(
+            'o', self._make_cycle_pane_handler(),
+            description='cycle_pane', require_prefix=True
+        )
+
+        self.input_router.register_binding(
+            'n', self._make_next_pane_handler(),
+            description='next_pane', require_prefix=True
+        )
+
+        self.input_router.register_binding(
+            'p', self._make_prev_pane_handler(),
+            description='prev_pane', require_prefix=True
+        )
+
     def _make_detach_handler(self) -> Callable:
         def handler():
             if 'detach' in self.handlers:
@@ -897,6 +941,30 @@ class KeyboardInputReader:
         def handler():
             if 'list_sessions' in self.handlers:
                 self.handlers['list_sessions']()
+        return handler
+
+    def _make_command_mode_handler(self) -> Callable:
+        def handler():
+            if 'command_mode' in self.handlers:
+                self.handlers['command_mode']()
+        return handler
+
+    def _make_cycle_pane_handler(self) -> Callable:
+        def handler():
+            if 'cycle_pane' in self.handlers:
+                self.handlers['cycle_pane']()
+        return handler
+
+    def _make_next_pane_handler(self) -> Callable:
+        def handler():
+            if 'next_pane' in self.handlers:
+                self.handlers['next_pane']()
+        return handler
+
+    def _make_prev_pane_handler(self) -> Callable:
+        def handler():
+            if 'prev_pane' in self.handlers:
+                self.handlers['prev_pane']()
         return handler
 
     def set_input_callback(self, callback: Callable[[bytes], None]) -> None:
