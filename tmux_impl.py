@@ -373,11 +373,11 @@ class ServerState:
             s.touch()
             return True, f"Renamed to '{new_name}'"
 
-    def kill_session(self, sid_or_name: str) -> Tuple[bool, str]:
+    def kill_session(self, sid_or_name: str) -> Tuple[bool, str, Optional[str]]:
         with self.lock:
             s = self.sessions.get(sid_or_name) or self._find_session_by_name(sid_or_name)
             if not s:
-                return False, f"Session '{sid_or_name}' not found"
+                return False, f"Session '{sid_or_name}' not found", None
             sid = s.id
             for p in list(s.panes.values()):
                 if p.pty_fd is not None:
@@ -387,7 +387,7 @@ class ServerState:
                         pass
                     self.pty_mgr.destroy_pty(p.pty_fd)
             del self.sessions[sid]
-            return True, f"Session '{sid_or_name}' killed"
+            return True, f"Session '{sid_or_name}' killed", sid
 
     def attach_by_name_or_id(self, target: str, client_id: str) -> Tuple[Optional[SessionData], str]:
         with self.lock:
@@ -735,10 +735,12 @@ def server_loop():
                     cols = msg.get("cols", 80)
                     rows = msg.get("rows", 24)
                     name = msg.get("name", "default")
+                    background = msg.get("background", False)
                     sess, info = SERVER.create_session(name, cols, rows, allow_rename=True)
                     if sess:
-                        clients[sess.id] = conn
-                        SERVER.attach_by_name_or_id(sess.id, client_id)
+                        if not background:
+                            clients[sess.id] = conn
+                            SERVER.attach_by_name_or_id(sess.id, client_id)
                         _resp(conn, type="ok", session_id=sess.id,
                               session_name=sess.name, info=info)
                     else:
@@ -775,13 +777,13 @@ def server_loop():
 
                 elif cmd == "kill":
                     target = msg.get("target", "")
-                    ok, info = SERVER.kill_session(target)
+                    ok, info, killed_sid = SERVER.kill_session(target)
                     if ok:
                         for c_sid, c in list(clients.items()):
                             if c_sid not in SERVER.sessions and c is conn:
                                 del clients[c_sid]
                     _resp(conn, type="ok" if ok else "error", msg=info,
-                          session_gone=(target == msg.get("session_id", "")))
+                          killed_sid=killed_sid)
 
                 elif cmd == "input":
                     sid = msg.get("session_id", "")
@@ -1204,6 +1206,7 @@ class ClientApp:
             pass
 
     def _main_loop(self):
+        self._last_status_tick = time.time()
         while self.running and not self.detached and not self.session_closed:
             try:
                 self.reader.poll()
@@ -1213,6 +1216,16 @@ class ClientApp:
             if self.command_mode:
                 self._command_mode_poll()
                 continue
+
+            now = time.time()
+            if now - self._last_status_tick >= 1.0:
+                self._last_status_tick = now
+                self.last_status_key = ""
+                if self.error_message and now >= self.error_expire_at:
+                    self.error_message = None
+                    self.error_expire_at = 0.0
+                    self.last_render_text = ""
+                self._request_render()
 
             msg = recv_msg(self.sock, 0.01)
             if msg:
@@ -1297,10 +1310,11 @@ class ClientApp:
             if focus_pane:
                 cx = focus_pane['x'] + min(focus_pane['cursor_x'], focus_pane['width'] - 1)
                 cy = focus_pane['y'] + min(focus_pane['cursor_y'], focus_pane['height'] - 1)
-                if focus_pane.get("cursor_vis", True) and not self.command_mode and not self.error_message:
+                cursor_in_pane = (cx, cy)
+                error_active = self.error_message and time.time() < self.error_expire_at
+                if focus_pane.get("cursor_vis", True) and not self.command_mode and not error_active:
                     parts.extend(f'\x1b[{cy + 1};{cx + 1}H'.encode())
                     parts.extend(b'\x1b[?25h')
-                cursor_in_pane = (cx, cy)
             else:
                 cursor_in_pane = None
 
@@ -1314,10 +1328,11 @@ class ClientApp:
 
             if self.command_mode:
                 pass
-            elif self.error_message and time.time() < self.error_expire_at:
-                pass
-            elif cursor_in_pane:
-                parts.extend(f'\x1b[{cursor_in_pane[1] + 1};{cursor_in_pane[0] + 1}H'.encode())
+            else:
+                error_active = self.error_message and time.time() < self.error_expire_at
+                if not error_active and cursor_in_pane:
+                    parts.extend(f'\x1b[{cursor_in_pane[1] + 1};{cursor_in_pane[0] + 1}H'.encode())
+                    parts.extend(b'\x1b[?25h')
 
             text = parts.decode('latin-1', errors='replace')
             if text != self.last_render_text:
@@ -1490,7 +1505,8 @@ class ClientApp:
             send_msg(self.sock, {
                 "cmd": "new", "name": name,
                 "cols": self.cols, "rows": self.rows,
-                "client_id": self.client_id
+                "client_id": self.client_id,
+                "background": True
             })
             resp = recv_msg(self.sock, 2.0) or {}
             if resp.get("type") == "ok":
@@ -1509,23 +1525,14 @@ class ClientApp:
             })
             resp = recv_msg(self.sock, 1.0) or {}
             ok = resp.get("type") == "ok"
-            msg = resp.get("msg", "")
-            if ok and target == self.session_id and resp.get("session_gone"):
+            info = resp.get("msg", "")
+            killed_sid = resp.get("killed_sid")
+            if ok and killed_sid == self.session_id:
                 self.session_closed = True
                 self.running = False
                 self._exit_command_mode(False)
                 return
-            if target == self.session_id:
-                send_msg(self.sock, {"cmd": "list", "client_id": self.client_id})
-                list_resp = recv_msg(self.sock, 0.5) or {}
-                if list_resp.get("type") == "ok":
-                    ids = [s["id"] for s in list_resp.get("sessions", [])]
-                    if self.session_id not in ids:
-                        self.session_closed = True
-                        self.running = False
-                        self._exit_command_mode(False)
-                        return
-            self._exec_result(ok, msg)
+            self._exec_result(ok, info)
             return
 
         elif cmd == "attach":
